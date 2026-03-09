@@ -124,8 +124,18 @@ async function loadMappings() {
   el.innerHTML = '<div class="mapping-list">' + keys.map(name => {
     const m = mappings[name];
     const backend = m.backend || 'auto';
-    const tagClass = backend === 'anthropic' ? 'tag-anthropic' : backend === 'openai' ? 'tag-openai' : 'tag-auto';
-    const tagLabel = backend === 'auto' ? '自动' : backend;
+    const tagClass = backend === 'anthropic'
+      ? 'tag-anthropic'
+      : backend === 'responses'
+        ? 'tag-responses'
+        : backend === 'openai'
+          ? 'tag-openai'
+          : 'tag-auto';
+    const tagLabel = backend === 'auto'
+      ? '自动'
+      : backend === 'responses'
+        ? 'responses'
+        : backend;
     const hasOverride = m.target_url || m.api_key;
     return `<div class="mapping-item">
       <div class="mapping-top">

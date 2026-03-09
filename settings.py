@@ -76,9 +76,12 @@ def resolve_model(model_name):
 
     if model_name in mappings:
         m = mappings[model_name]
+        backend = m.get('backend')
+        if backend in ('', None, 'auto'):
+            backend = _auto_detect(model_name)
         return {
             'upstream_model': m.get('upstream_model') or model_name,
-            'backend': m.get('backend') or _auto_detect(model_name),
+            'backend': backend,
             'target_url': m.get('target_url') or base_url,
             'api_key': m.get('api_key') or base_key,
         }

@@ -11,22 +11,32 @@ Cursor 根据模型名发送不同格式的请求：
 | `claude-sonnet-*`、`glm-*` | `/v1/chat/completions` (OpenAI CC) |
 | `gpt-*`、`claude-opus-*` | `/v1/responses` (OpenAI Responses) |
 
-而中转站通常只支持 `/v1/chat/completions` 或 `/v1/messages`。
+而中转站通常只支持 `/v1/chat/completions`、`/v1/messages` 或 `/v1/responses`。
 
 本项目在中间做协议转换，**不管 Cursor 发什么格式，都能正确转发到中转站；不管中转站返回什么格式，都让 Cursor 能正确接收**。
 
 ## 架构
 
+可以把这个项目理解成“三种入口协议 + 三种上游后端协议”的协议桥：
+
+```text
+Cursor                         API 2 Cursor                           中转站
+  │                                 │                                   │
+  ├─ /v1/chat/completions ─────→ chat.py ─────┬─ openai 后端 ─────────→ /v1/chat/completions
+  │                                            ├─ anthropic 后端 ─────→ /v1/messages
+  │                                            └─ responses 后端 ─────→ /v1/responses
+  │
+  ├─ /v1/responses ────────────→ responses.py ─┬─ openai 后端 ───────→ /v1/chat/completions
+  │                                             ├─ anthropic 后端 ───→ /v1/messages
+  │                                             └─ responses 后端 ───→ /v1/responses
+  │
+  └─ /v1/messages ─────────────→ messages.py ─────────────────────────→ /v1/messages
 ```
-Cursor                      API 2 Cursor                      中转站
-  │                              │                              │
-  ├─ /v1/chat/completions ──→ chat.py ─┬─ openai 后端 ────────→ /v1/chat/completions
-  │                                     └─ anthropic 后端 ────→ /v1/messages
-  │                              │
-  ├─ /v1/responses ──────→ responses.py → 转为 CC → 同上 → 转回 Responses
-  │                              │
-  └─ /v1/messages ───────→ messages.py → 直接透传 ────────────→ /v1/messages
-```
+
+其中：
+- `chat.py` 负责接住 Cursor 的 Chat Completions 请求，并根据模型映射决定发往哪种后端协议
+- `responses.py` 负责接住 Cursor 的 Responses 请求，并在需要时做 `Responses ↔ CC` 或 `Responses ↔ Messages` 桥接
+- `messages.py` 负责 Anthropic 原生消息的直通场景
 
 ## 快速开始
 
@@ -70,10 +80,12 @@ docker compose up -d
 
 - **Cursor 模型名** — 在 Cursor 自定义模型中填入的名称
 - **上游模型名** — 发送到中转站的实际模型名
-- **后端类型** — `openai` (CC 格式) / `anthropic` (Messages 格式) / `auto` (自动检测)
+- **后端类型** — `openai` (CC 格式) / `anthropic` (Messages 格式) / `responses` (Responses 格式) / `auto` (自动检测)
 - **自定义地址/密钥** — 可选，覆盖全局设置，实现分流到不同中转站
 
 **示例**：在 Cursor 中添加 `claude-sonnet-4-5-20250929`，映射到上游 `gpt-5.3-codex`，后端选 `openai`。Cursor 会用 CC 格式发送请求，代理直接转发到中转站的 `/v1/chat/completions`。
+
+如果你的中转站只支持 `/v1/responses`，可以把后端类型选成 `responses`。此时代理会把 Cursor 发来的请求转换或透传为 Responses 格式，再发往中转站的 `/v1/responses`。
 
 > **提示**：使用 Claude 风格的模型名（如 `claude-sonnet-4-5-20250929`）可以让 Cursor 显示思考过程（thinking）。
 
@@ -86,26 +98,27 @@ docker compose up -d
 
 ## 项目结构
 
-```
+```text
 api2cursor/
-├── start.py               # 启动入口
-├── app.py                 # Flask 应用工厂
-├── config.py              # 环境变量配置
-├── settings.py            # 持久化配置管理
-├── routes/                # 路由层
-│   ├── chat.py            #   /v1/chat/completions
-│   ├── responses.py       #   /v1/responses
-│   ├── messages.py        #   /v1/messages (透传)
-│   └── admin.py           #   管理面板 + API
-├── adapters/              # 适配层（格式转换）
-│   ├── openai_anthropic.py#   CC ↔ Messages 双向转换
-│   ├── openai_fixer.py    #   OpenAI 请求/响应修复
-│   └── responses_adapter.py#  Responses ↔ CC 双向转换
-├── utils/                 # 工具层
-│   ├── http.py            #   请求转发、SSE 解析
-│   ├── tool_fixer.py      #   工具参数修复
-│   └── think_tag.py       #   <think> 标签提取
-└── static/                # 管理面板前端
+├── start.py                    # 启动入口
+├── app.py                      # Flask 应用工厂
+├── config.py                   # 环境变量配置
+├── settings.py                 # 持久化配置管理
+├── routes/                     # 路由层：按对外 API 入口拆分
+│   ├── chat.py                 #   /v1/chat/completions
+│   ├── responses.py            #   /v1/responses
+│   ├── messages.py             #   /v1/messages（透传）
+│   ├── admin.py                #   管理面板 + API
+│   └── common.py               #   路由公共上下文、日志与 SSE 辅助
+├── adapters/                   # 适配层：按协议桥接职责拆分
+│   ├── cc_anthropic_adapter.py #   Chat Completions ↔ Anthropic Messages
+│   ├── openai_compat_fixer.py  #   OpenAI / Chat Completions 兼容修复
+│   └── responses_cc_adapter.py #   Responses ↔ Chat Completions + 原生 Responses 流桥接
+├── utils/                      # 通用工具层
+│   ├── http.py                 #   请求转发、SSE 解析
+│   ├── tool_fixer.py           #   工具参数修复
+│   └── think_tag.py            #   <think> 标签提取
+└── static/                     # 管理面板前端
     ├── admin.html
     ├── admin.css
     └── admin.js

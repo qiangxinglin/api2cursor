@@ -1,8 +1,11 @@
 """HTTP 工具 - 请求头构建、上游转发、SSE 流解析、响应构建"""
 
+from __future__ import annotations
+
 import json
-import uuid
 import logging
+import uuid
+from typing import Any, Iterator
 
 import requests
 from flask import Response, jsonify
@@ -12,7 +15,7 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
-def gen_id(prefix=''):
+def gen_id(prefix: str = '') -> str:
     """生成唯一 ID"""
     return f'{prefix}{uuid.uuid4().hex[:24]}'
 
@@ -20,7 +23,7 @@ def gen_id(prefix=''):
 # ─── 请求头构建 ────────────────────────────────────
 
 
-def build_openai_headers(api_key):
+def build_openai_headers(api_key: str) -> dict[str, str]:
     """构建 OpenAI 兼容请求头"""
     return {
         'Authorization': f'Bearer {api_key}',
@@ -28,7 +31,7 @@ def build_openai_headers(api_key):
     }
 
 
-def build_anthropic_headers(api_key):
+def build_anthropic_headers(api_key: str) -> dict[str, str]:
     """构建 Anthropic 请求头，根据密钥前缀自动选择鉴权方式"""
     headers = {
         'anthropic-version': '2023-06-01',
@@ -94,7 +97,7 @@ def forward_request(url, headers, payload, stream=False):
 # ─── SSE 流解析 ───────────────────────────────────
 
 
-def iter_openai_sse(response):
+def iter_openai_sse(response) -> Iterator[dict[str, Any] | None]:
     """解析 OpenAI SSE 流，yield chunk 字典；yield None 表示 [DONE]"""
     for line in response.iter_lines():
         if not line:
@@ -112,8 +115,18 @@ def iter_openai_sse(response):
             continue
 
 
-def iter_anthropic_sse(response):
+def iter_anthropic_sse(response) -> Iterator[tuple[str, dict[str, Any]]]:
     """解析 Anthropic SSE 流，yield (event_type, data_dict) 元组"""
+    yield from _iter_event_sse(response)
+
+
+def iter_responses_sse(response) -> Iterator[tuple[str, dict[str, Any]]]:
+    """解析 OpenAI Responses SSE 流，yield (event_type, data_dict) 元组"""
+    yield from _iter_event_sse(response)
+
+
+def _iter_event_sse(response) -> Iterator[tuple[str, dict[str, Any]]]:
+    """解析带 event/data 的通用 SSE 流。"""
     event_type = ''
     for line in response.iter_lines():
         if not line:

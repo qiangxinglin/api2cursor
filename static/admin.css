@@ -58,6 +58,7 @@ main{padding:28px 0 60px}
 .tag{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:500}
 .tag-anthropic{background:rgba(249,115,22,.15);color:#fb923c}
 .tag-openai{background:rgba(16,185,129,.15);color:#34d399}
+.tag-responses{background:rgba(59,130,246,.15);color:#60a5fa}
 .tag-auto{background:rgba(139,92,246,.15);color:#a78bfa}
 .tag-override{background:rgba(59,130,246,.1);color:var(--primary)}
 .mapping-actions{margin-left:auto;display:flex;gap:6px}

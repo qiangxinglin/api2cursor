@@ -94,11 +94,13 @@
           <option value="auto">自动检测</option>
           <option value="anthropic">Anthropic (/v1/messages)</option>
           <option value="openai">OpenAI (/v1/chat/completions)</option>
+          <option value="responses">OpenAI Responses (/v1/responses)</option>
         </select>
       </div>
       <div class="hint">
         <b>anthropic</b>：转换为 Anthropic Messages 格式 — 适用于中转站通过 <code>/v1/messages</code> 提供 Claude 模型<br>
         <b>openai</b>：保持 OpenAI Chat Completions 格式 — 适用于 GPT、DeepSeek、Codex 或通过 <code>/v1/chat/completions</code> 提供所有模型的中转站<br>
+        <b>responses</b>：保持 OpenAI Responses 格式 — 适用于中转站仅通过 <code>/v1/responses</code> 提供模型能力<br>
         <b>自动检测</b>：根据上游模型名判断（含 claude → anthropic，其他 → openai）
       </div>
     </div>
