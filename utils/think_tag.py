@@ -30,23 +30,83 @@ class ThinkTagExtractor:
 
     处理跨 chunk 的 <think>...</think> 标签，将标签内的文本
     转为 reasoning_content delta，标签外的文本保持为 content delta。
+
+    额外处理：
+    - content 和 tool_calls 同时出现时拆分为两个独立 chunk（Cursor 会丢弃同时包含两者的 content）
+    - tool_calls 首次出现时在前面插入换行，确保文本以换行结束
+    - 流结束时如果 think 标签仍未关闭，自动合成关闭 chunk
     """
 
     def __init__(self):
         """初始化跨 chunk 的 thinking 状态跟踪。"""
         self._in_thinking = False
+        self._tool_calls_seen = False
 
     def process_chunk(self, chunk):
         """处理一个流式 chunk，返回转换后的 chunk 列表"""
         for choice in (chunk.get('choices') or []):
             delta = choice.get('delta') or {}
+
+            has_tool_calls = bool(delta.get('tool_calls'))
+            has_content = delta.get('content') is not None and delta.get('content') != ''
+
+            # content 和 tool_calls 同时出现：拆分为两个独立事件
+            if has_content and has_tool_calls:
+                results = []
+                content_chunk = self._make(chunk, content=delta['content'])
+                results.extend(self._process_content(content_chunk, delta['content']))
+                tc_chunk = {
+                    'id': chunk.get('id', ''),
+                    'object': 'chat.completion.chunk',
+                    'model': chunk.get('model', ''),
+                    'choices': [{'index': 0, 'delta': {'tool_calls': delta['tool_calls']},
+                                 'finish_reason': choice.get('finish_reason')}],
+                }
+                results.extend(self._handle_tool_calls_chunk(tc_chunk))
+                return results
+
+            if has_tool_calls:
+                return self._handle_tool_calls_chunk(chunk)
+
             if delta.get('reasoning_content'):
                 return [chunk]
             content = delta.get('content')
             if content is None or content == '':
                 return [chunk]
-            return self._split(chunk, content)
+            return self._process_content(chunk, content)
         return [chunk]
+
+    def finalize(self):
+        """流结束时调用，如果 think 标签仍未关闭则返回关闭 chunk"""
+        if not self._in_thinking:
+            return None
+        self._in_thinking = False
+        return {
+            'id': '',
+            'object': 'chat.completion.chunk',
+            'model': '',
+            'choices': [{'index': 0, 'delta': {'content': '\n</think>\n\n'}, 'finish_reason': None}],
+        }
+
+    def _process_content(self, chunk, content):
+        """处理包含 content 的 chunk"""
+        return self._split(chunk, content)
+
+    def _handle_tool_calls_chunk(self, chunk):
+        """处理包含 tool_calls 的 chunk，首次出现时在前面插入换行"""
+        results = []
+        if not self._tool_calls_seen:
+            self._tool_calls_seen = True
+            if self._in_thinking:
+                self._in_thinking = False
+                results.append(self._make(chunk, content='\n</think>\n\n'))
+            else:
+                results.append(self._make(chunk, content='\n'))
+        elif self._in_thinking:
+            self._in_thinking = False
+            results.append(self._make(chunk, content='\n</think>\n\n'))
+        results.append(chunk)
+        return results
 
     def _split(self, chunk, text):
         """根据 <think> 标签拆分文本为多个 chunk"""

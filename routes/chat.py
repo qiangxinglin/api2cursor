@@ -165,6 +165,9 @@ def _handle_openai_stream(
         for chunk in iter_openai_sse(resp):
             if chunk is None:
                 _dbg(f'流式响应结束，共 {chunk_count} 个数据片段')
+                close_chunk = think_extractor.finalize()
+                if close_chunk:
+                    yield sse_data_message(close_chunk)
                 yield sse_data_message('[DONE]')
                 return
 

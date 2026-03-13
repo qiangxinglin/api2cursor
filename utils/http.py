@@ -126,10 +126,15 @@ def iter_responses_sse(response) -> Iterator[tuple[str, dict[str, Any]]]:
 
 
 def _iter_event_sse(response) -> Iterator[tuple[str, dict[str, Any]]]:
-    """解析带 event/data 的通用 SSE 流。"""
+    """解析带 event/data 的通用 SSE 流。
+
+    SSE 规范中空行是事件分隔符，遇到空行时重置 event_type，
+    避免前一个事件的类型泄漏到下一个事件。
+    """
     event_type = ''
     for line in response.iter_lines():
         if not line:
+            event_type = ''
             continue
         decoded = line.decode('utf-8', errors='replace')
         if decoded.startswith('event:'):

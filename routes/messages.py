@@ -93,9 +93,14 @@ def _inject_thinking(data):
 
 
 def _process_stream(resp):
-    """处理 /v1/messages 流式响应，检测并注入 thinking 事件"""
+    """处理 /v1/messages 流式响应，检测并注入 thinking 事件
+
+    追踪上游 content block 的 index，在注入 thinking blocks 时使用独立的 index，
+    并将后续上游 block 的 index 偏移，避免冲突。
+    """
     reasoning_buf = ''
     injected = False
+    index_offset = 0
 
     for line in resp.iter_lines():
         if not line:
@@ -119,7 +124,6 @@ def _process_stream(resp):
 
         modified = False
 
-        # 提取 reasoning_content
         for container_key in ('message', 'delta'):
             container = event_data.get(container_key)
             if not container:
@@ -129,12 +133,16 @@ def _process_stream(resp):
                 reasoning_buf += rc
                 modified = True
 
-        # 在首个 text_delta 前注入 thinking blocks
         if reasoning_buf and not injected:
             if event_data.get('delta', {}).get('type') == 'text_delta':
                 injected = True
                 yield from _emit_thinking_blocks(reasoning_buf)
+                index_offset = 1
                 reasoning_buf = ''
+
+        if index_offset and 'index' in event_data:
+            event_data['index'] = event_data['index'] + index_offset
+            modified = True
 
         yield f'data: {json.dumps(event_data)}\n\n' if modified else decoded + '\n\n'
 

@@ -5,13 +5,13 @@
   - model_mappings: Cursor 模型名 → {upstream_model, backend, target_url, api_key, custom_instructions}
 """
 
+import copy
 import json
 import os
 import threading
 
 from config import Config
 
-# 数据目录放在项目根目录下，便于 Docker 卷挂载
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_ROOT_DIR, 'data')
 SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
@@ -38,10 +38,10 @@ def load():
                 with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                     _cache = {**_DEFAULTS, **json.load(f)}
             except (json.JSONDecodeError, OSError):
-                _cache = dict(_DEFAULTS)
+                _cache = copy.deepcopy(_DEFAULTS)
         else:
-            _cache = dict(_DEFAULTS)
-    return dict(_cache)
+            _cache = copy.deepcopy(_DEFAULTS)
+    return copy.deepcopy(_cache)
 
 
 def save(data):
@@ -58,10 +58,13 @@ def save(data):
 
 
 def get():
-    """获取当前配置快照，优先返回内存缓存中的结果。"""
-    if _cache is None:
-        return load()
-    return dict(_cache)
+    """获取当前配置的深拷贝快照，保证调用方修改不影响缓存。"""
+    with _lock:
+        if _cache is None:
+            pass
+        else:
+            return copy.deepcopy(_cache)
+    return load()
 
 
 def get_url():
