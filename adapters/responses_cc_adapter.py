@@ -654,10 +654,6 @@ class ResponsesToCCStreamConverter:
             'completion_tokens': self._usage.get('output_tokens', 0),
             'total_tokens': self._usage.get('total_tokens', 0),
         }
-        if isinstance(self._usage.get('input_tokens_details'), dict):
-            chunk['usage']['prompt_tokens_details'] = dict(self._usage['input_tokens_details'])
-        if isinstance(self._usage.get('output_tokens_details'), dict):
-            chunk['usage']['completion_tokens_details'] = dict(self._usage['output_tokens_details'])
         return [chunk]
 
     def _make_chunk(self, delta: JsonDict, finish_reason: str | None = None) -> JsonDict:
@@ -682,44 +678,20 @@ def _copy_request_options(payload: JsonDict, result: JsonDict) -> None:
     """将 Responses 请求中的通用选项复制到 CC 请求体。"""
     if 'tools' in payload:
         result['tools'] = _convert_tools(payload['tools'])
-    for key in (
-        'temperature',
-        'top_p',
-        'tool_choice',
-        'parallel_tool_calls',
-        'truncation',
-        'store',
-        'metadata',
-        'conversation',
-        'previous_response_id',
-        'prompt_cache_key',
-        'service_tier',
-        'user',
-    ):
+    for key in ('temperature', 'top_p'):
         if key in payload:
             result[key] = payload[key]
     if 'max_output_tokens' in payload:
         result['max_tokens'] = payload['max_output_tokens']
+    if 'tool_choice' in payload:
+        result['tool_choice'] = payload['tool_choice']
 
 
 def _copy_responses_request_options(payload: JsonDict, result: JsonDict) -> None:
     """将聊天补全请求中的通用选项复制到原生 Responses 请求体。"""
     if 'tools' in payload:
         result['tools'] = _convert_cc_tools_to_responses(payload['tools'])
-    for key in (
-        'temperature',
-        'top_p',
-        'tool_choice',
-        'parallel_tool_calls',
-        'truncation',
-        'store',
-        'metadata',
-        'conversation',
-        'previous_response_id',
-        'prompt_cache_key',
-        'service_tier',
-        'user',
-    ):
+    for key in ('temperature', 'top_p', 'tool_choice'):
         if key in payload:
             result[key] = payload[key]
     if 'max_tokens' in payload:
@@ -942,18 +914,11 @@ def _make_function_call_output_item(tool_call: JsonDict) -> JsonDict:
 
 def _build_responses_usage(usage: JsonDict) -> JsonDict:
     """将 Chat Completions 的 usage 字段映射为 Responses usage 结构。"""
-    result = {
+    return {
         'input_tokens': usage.get('prompt_tokens', 0),
         'output_tokens': usage.get('completion_tokens', 0),
         'total_tokens': usage.get('total_tokens', 0),
     }
-    prompt_details = usage.get('prompt_tokens_details')
-    if isinstance(prompt_details, dict):
-        result['input_tokens_details'] = dict(prompt_details)
-    completion_details = usage.get('completion_tokens_details')
-    if isinstance(completion_details, dict):
-        result['output_tokens_details'] = dict(completion_details)
-    return result
 
 
 def _collect_cc_parts_from_responses_output(output_items: Any) -> tuple[str, str, list[JsonDict]]:
