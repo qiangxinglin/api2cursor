@@ -18,13 +18,21 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from adapters.helpers import (
+    build_cc_message,
+    build_cc_response,
+    build_cc_tool_call,
+    build_cc_usage,
+    extract_text,
+    make_cc_chunk,
+    parse_json_safe,
+    stringify_content,
+)
 from utils.http import gen_id
 from utils.tool_fixer import fix_anthropic_tool_use, normalize_args, repair_str_replace_args
 
 JsonDict = dict[str, Any]
 
-
-# Anthropic stop_reason → OpenAI finish_reason
 _STOP_REASON_MAP = {
     'end_turn': 'stop',
     'max_tokens': 'length',
@@ -78,23 +86,18 @@ def messages_to_cc_response(data: JsonDict, request_id: str | None = None) -> Js
     data = fix_anthropic_tool_use(data)
 
     content_text, reasoning_text, tool_calls = _collect_response_parts(data.get('content', []))
-    message = _build_cc_message(content_text, reasoning_text, tool_calls)
     usage = data.get('usage', {})
 
-    return {
-        'id': request_id,
-        'object': 'chat.completion',
-        'model': data.get('model', 'claude'),
-        'choices': [{
-            'index': 0,
-            'message': message,
-            'finish_reason': _STOP_REASON_MAP.get(data.get('stop_reason', 'end_turn'), 'stop'),
-        }],
-        'usage': _build_cc_usage(
+    return build_cc_response(
+        response_id=request_id,
+        message=build_cc_message(content_text, reasoning_text, tool_calls),
+        finish_reason=_STOP_REASON_MAP.get(data.get('stop_reason', 'end_turn'), 'stop'),
+        usage=build_cc_usage(
             input_tokens=usage.get('input_tokens', 0),
             output_tokens=usage.get('output_tokens', 0),
         ),
-    }
+        model=data.get('model', 'claude'),
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -124,12 +127,8 @@ class AnthropicStreamConverter:
         self._input_tokens = 0
         self._output_tokens = 0
 
-    def process_event(self, event_type: str, event_data: JsonDict) -> list[str]:
-        """处理单个 Anthropic SSE 事件。
-
-        调用方会按事件顺序不断喂入 event/data，这里根据事件类型拆成一个或多个 CC chunk
-        字符串，交给上层直接作为 SSE data 发送给 Cursor。
-        """
+    def process_event(self, event_type: str, event_data: JsonDict) -> list[JsonDict]:
+        """处理单个 Anthropic SSE 事件，返回 CC chunk dict 列表。"""
         if event_type == 'message_start':
             return self._handle_message_start(event_data)
         if event_type == 'content_block_start':
@@ -140,104 +139,64 @@ class AnthropicStreamConverter:
             return self._handle_message_delta(event_data)
         return []
 
-    def _handle_message_start(self, event_data: JsonDict) -> list[str]:
-        """处理消息开始事件，产出 assistant 角色起始 chunk。
-
-        这个起始 chunk 很重要，因为 Cursor 侧通常会依赖首个带 role 的 chunk 来初始化
-        当前 assistant 消息。
-        """
+    def _handle_message_start(self, event_data: JsonDict) -> list[JsonDict]:
         message = event_data.get('message', {})
         self._input_tokens = message.get('usage', {}).get('input_tokens', 0)
-
         chunk = self._make_chunk(delta={'role': 'assistant', 'content': ''})
         if message.get('model'):
             chunk['model'] = message['model']
-        return [self._dump_chunk(chunk)]
+        return [chunk]
 
-    def _handle_content_block_start(self, event_data: JsonDict) -> list[str]:
-        """处理内容块开始事件。
-
-        目前这里只需要显式处理 `tool_use`，因为文本和 thinking 的真正内容都在后续 delta
-        事件里；而 tool_use 需要先开一个空 arguments 的 tool_call 槽位。
-        """
+    def _handle_content_block_start(self, event_data: JsonDict) -> list[JsonDict]:
         block = event_data.get('content_block', {})
         if block.get('type') != 'tool_use':
             return []
-
         self._tool_index += 1
-        return [self._dump_chunk(self._make_chunk(delta={
+        return [self._make_chunk(delta={
             'tool_calls': [{
                 'index': self._tool_index,
                 'id': block.get('id', gen_id('toolu_')),
                 'type': 'function',
-                'function': {
-                    'name': block.get('name', ''),
-                    'arguments': '',
-                },
+                'function': {'name': block.get('name', ''), 'arguments': ''},
             }]
-        }))]
+        })]
 
-    def _handle_content_block_delta(self, event_data: JsonDict) -> list[str]:
-        """处理内容块增量事件。
-
-        Anthropic 会把文本、思考内容、工具参数拆成不同 delta 类型，这里要分别映射成
-        OpenAI chunk 里的 `content`、`reasoning_content` 和 `tool_calls.function.arguments`。
-        """
+    def _handle_content_block_delta(self, event_data: JsonDict) -> list[JsonDict]:
         delta = event_data.get('delta', {})
         delta_type = delta.get('type', '')
 
         if delta_type == 'text_delta' and delta.get('text'):
-            return [self._dump_chunk(self._make_chunk(delta={'content': delta['text']}))]
-
+            return [self._make_chunk(delta={'content': delta['text']})]
         if delta_type == 'thinking_delta' and delta.get('thinking'):
-            return [self._dump_chunk(self._make_chunk(delta={'reasoning_content': delta['thinking']}))]
-
+            return [self._make_chunk(delta={'reasoning_content': delta['thinking']})]
         if delta_type == 'input_json_delta' and delta.get('partial_json'):
-            return [self._dump_chunk(self._make_chunk(delta={
+            return [self._make_chunk(delta={
                 'tool_calls': [{
                     'index': self._tool_index,
                     'function': {'arguments': delta['partial_json']},
                 }]
-            }))]
-
+            })]
         return []
 
-    def _handle_message_delta(self, event_data: JsonDict) -> list[str]:
-        """处理消息收尾事件，补出 finish_reason 和 usage。
-
-        当 Anthropic 发出 `message_delta` 时，说明这一轮 assistant 输出已经收束，
-        这里会统一生成最后一个带 usage 的收尾 chunk。
-        """
+    def _handle_message_delta(self, event_data: JsonDict) -> list[JsonDict]:
         delta = event_data.get('delta', {})
         usage = event_data.get('usage', {})
         self._output_tokens = usage.get('output_tokens', 0)
-
-        chunk = self._make_chunk(
+        chunk = make_cc_chunk(
+            self._id,
             delta={},
             finish_reason=_STOP_REASON_MAP.get(delta.get('stop_reason', ''), 'stop'),
+            model='claude',
         )
-        chunk['usage'] = _build_cc_usage(
+        chunk['usage'] = build_cc_usage(
             input_tokens=self._input_tokens,
             output_tokens=self._output_tokens,
         )
-        return [self._dump_chunk(chunk)]
+        return [chunk]
 
     def _make_chunk(self, delta: JsonDict, finish_reason: str | None = None) -> JsonDict:
         """构造标准 OpenAI Chat Completions chunk 对象。"""
-        choice: JsonDict = {'index': 0, 'delta': delta}
-        if finish_reason:
-            choice['finish_reason'] = finish_reason
-        return {
-            'id': self._id,
-            'object': 'chat.completion.chunk',
-            'model': 'claude',
-            'choices': [choice],
-        }
-
-    @staticmethod
-    def _dump_chunk(chunk: JsonDict) -> str:
-        """统一序列化 chunk，方便上层直接写入 SSE data。"""
-        return json.dumps(chunk)
+        return make_cc_chunk(self._id, delta, finish_reason, model='claude')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -254,7 +213,7 @@ def _convert_request_message(message: Any) -> tuple[JsonDict | None, str | None]
     content = message.get('content', '')
 
     if role == 'system':
-        return None, _flatten_text(content)
+        return None, extract_text(content)
     if role == 'tool':
         return _convert_tool_role_message(message), None
 
@@ -301,7 +260,7 @@ def _append_tool_use_blocks(content: Any, tool_calls: list[Any]) -> list[JsonDic
             'type': 'tool_use',
             'id': tool_call.get('id', gen_id('toolu_')),
             'name': function_data.get('name', ''),
-            'input': _parse_tool_arguments(function_data.get('arguments', '{}')),
+            'input': parse_json_safe(function_data.get('arguments', '{}')),
         })
     return blocks
 
@@ -372,71 +331,17 @@ def _convert_tool_use_block(block: JsonDict, *, index: int) -> JsonDict:
     else:
         arguments_text = str(input_data)
 
-    return {
-        'index': index,
-        'id': block.get('id', gen_id('toolu_')),
-        'type': 'function',
-        'function': {
-            'name': tool_name,
-            'arguments': arguments_text,
-        },
-    }
-
-
-def _build_cc_message(content_text: str, reasoning_text: str, tool_calls: list[JsonDict]) -> JsonDict:
-    """构造 OpenAI CC 响应中的 assistant message。"""
-    message: JsonDict = {
-        'role': 'assistant',
-        'content': content_text or None,
-    }
-    if reasoning_text:
-        message['reasoning_content'] = reasoning_text
-    if tool_calls:
-        message['tool_calls'] = tool_calls
-    return message
-
-
-def _build_cc_usage(*, input_tokens: int, output_tokens: int) -> JsonDict:
-    """将 Anthropic usage 字段映射为 OpenAI usage。"""
-    return {
-        'prompt_tokens': input_tokens,
-        'completion_tokens': output_tokens,
-        'total_tokens': input_tokens + output_tokens,
-    }
+    return build_cc_tool_call(
+        call_id=block.get('id', gen_id('toolu_')),
+        name=tool_name,
+        arguments=arguments_text,
+        index=index,
+    )
 
 
 # ═══════════════════════════════════════════════════════════
 #  通用辅助
 # ═══════════════════════════════════════════════════════════
-
-
-def _parse_tool_arguments(arguments: Any) -> Any:
-    """将 tool_call.arguments 尽量解析为对象，供 Anthropic tool_use.input 使用。
-
-    Anthropic 的 `tool_use.input` 天然期望对象结构；如果这里直接保留原始字符串，
-    后续上游会把它当普通文本而不是工具参数对象。
-    """
-    if not isinstance(arguments, str):
-        return arguments if arguments is not None else {}
-    try:
-        return json.loads(arguments)
-    except json.JSONDecodeError:
-        return {}
-
-
-def _flatten_text(content: Any) -> str:
-    """将 content 扁平化为纯文本，主要用于 system 消息上提。"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict) and part.get('type') == 'text':
-                parts.append(part.get('text', ''))
-        return '\n'.join(parts)
-    return str(content)
 
 
 def _convert_content(message: JsonDict) -> Any:
@@ -708,3 +613,78 @@ def _pick_window_anchor(refs: list[JsonDict], target: int) -> int | None:
         if 'cache_control' not in refs[i]:
             return i
     return None
+
+
+# ═══════════════════════════════════════════════════════════
+#  OutboundTransformer 实现: Anthropic Messages
+# ═══════════════════════════════════════════════════════════
+
+
+class AnthropicOutbound:
+    """Anthropic Messages 后端的出站转换器。
+
+    将 CC 格式转换为 Anthropic Messages 格式并处理响应。
+    """
+
+    def build_request(self, payload: JsonDict) -> JsonDict:
+        return cc_to_messages_request(payload)
+
+    def build_url(self, ctx) -> str:
+        return f'{ctx.target_url.rstrip("/")}/v1/messages'
+
+    def build_headers(self, ctx) -> dict[str, str]:
+        from utils.http import build_anthropic_headers
+        return build_anthropic_headers(ctx.api_key)
+
+    def parse_response(self, raw: JsonDict) -> JsonDict:
+        return messages_to_cc_response(raw)
+
+    def create_stream_processor(self) -> AnthropicStreamProcessor:
+        return AnthropicStreamProcessor()
+
+
+class AnthropicStreamProcessor:
+    """Anthropic SSE 流式处理器。
+
+    包装 iter_anthropic_sse + AnthropicStreamConverter，
+    将 Anthropic 事件流转换为 CC chunk。
+    """
+
+    def __init__(self):
+        self._converter = AnthropicStreamConverter()
+        self._input_tokens = 0
+        self._output_tokens = 0
+
+    def iter_events(self, response) -> Iterator:
+        from utils.http import iter_anthropic_sse
+        yield from iter_anthropic_sse(response)
+
+    def process_event(self, event: tuple) -> list[JsonDict]:
+        event_type, event_data = event
+        return self._converter.process_event(event_type, event_data)
+
+    def extract_usage(self, event: tuple) -> JsonDict | None:
+        event_type, event_data = event
+        if event_type == 'message_start':
+            message_usage = event_data.get('message', {}).get('usage', {})
+            if isinstance(message_usage, dict):
+                self._input_tokens = message_usage.get('input_tokens', 0)
+                return {
+                    'prompt_tokens': self._input_tokens,
+                    'completion_tokens': 0,
+                    'total_tokens': self._input_tokens,
+                }
+        elif event_type == 'message_delta':
+            delta_usage = event_data.get('usage', {})
+            if isinstance(delta_usage, dict):
+                completion = delta_usage.get('output_tokens', 0)
+                self._output_tokens = completion
+                return {
+                    'prompt_tokens': self._input_tokens,
+                    'completion_tokens': completion,
+                    'total_tokens': self._input_tokens + completion,
+                }
+        return None
+
+    def finalize(self) -> list[JsonDict]:
+        return []

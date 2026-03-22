@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Iterator
 
 from utils.http import gen_id
 from utils.think_tag import extract_from_text
@@ -423,3 +423,60 @@ def _rewrite_function_call_finish_reason(choice: JsonDict) -> None:
     """将旧版 finish_reason=function_call 升级为 tool_calls。"""
     if choice.get('finish_reason') == 'function_call':
         choice['finish_reason'] = 'tool_calls'
+
+
+# ═══════════════════════════════════════════════════════════
+#  OutboundTransformer 实现: OpenAI Chat
+# ═══════════════════════════════════════════════════════════
+
+
+class OpenAIChatOutbound:
+    """OpenAI Chat Completions 后端的出站转换器。
+
+    由于 CC 本身就是 OpenAI Chat 格式，请求/响应转换主要做兼容性修复。
+    """
+
+    def build_request(self, payload: JsonDict) -> JsonDict:
+        return normalize_request(payload)
+
+    def build_url(self, ctx) -> str:
+        return f'{ctx.target_url.rstrip("/")}/v1/chat/completions'
+
+    def build_headers(self, ctx) -> dict[str, str]:
+        from utils.http import build_openai_headers
+        return build_openai_headers(ctx.api_key)
+
+    def parse_response(self, raw: JsonDict) -> JsonDict:
+        return fix_response(raw)
+
+    def create_stream_processor(self) -> OpenAIChatStreamProcessor:
+        return OpenAIChatStreamProcessor()
+
+
+class OpenAIChatStreamProcessor:
+    """OpenAI Chat SSE 流式处理器。
+
+    包装 iter_openai_sse + fix_stream_chunk + ThinkTagExtractor。
+    """
+
+    def __init__(self):
+        from utils.think_tag import ThinkTagExtractor
+        self._think_extractor = ThinkTagExtractor()
+
+    def iter_events(self, response) -> Iterator:
+        from utils.http import iter_openai_sse
+        for chunk in iter_openai_sse(response):
+            if chunk is None:
+                return
+            yield chunk
+
+    def process_event(self, event: JsonDict) -> list[JsonDict]:
+        chunk = fix_stream_chunk(event)
+        return list(self._think_extractor.process_chunk(chunk))
+
+    def extract_usage(self, event: JsonDict) -> JsonDict | None:
+        return event.get('usage')
+
+    def finalize(self) -> list[JsonDict]:
+        close_chunk = self._think_extractor.finalize()
+        return [close_chunk] if close_chunk else []

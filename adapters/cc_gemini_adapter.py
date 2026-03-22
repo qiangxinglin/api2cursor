@@ -8,8 +8,17 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Iterator
 
+from adapters.helpers import (
+    build_cc_message,
+    build_cc_response,
+    build_cc_tool_call,
+    build_cc_usage,
+    extract_text,
+    make_cc_chunk,
+    parse_json_safe,
+)
 from utils.http import gen_id
 
 JsonDict = dict[str, Any]
@@ -38,7 +47,7 @@ def cc_to_gemini_request(payload: JsonDict) -> JsonDict:
     for msg in messages:
         role = msg.get('role', '')
         if role in ('system', 'developer'):
-            system_parts.append(_flatten_text(msg.get('content', '')))
+            system_parts.append(extract_text(msg.get('content', '')))
             continue
         converted = _convert_message(msg)
         if converted:
@@ -84,21 +93,13 @@ def gemini_to_cc_response(data: JsonDict, request_id: str | None = None) -> Json
     else:
         finish_reason = _FINISH_REASON_MAP.get(finish, 'stop')
 
-    message: JsonDict = {'role': 'assistant', 'content': content_text or None}
-    if reasoning_text:
-        message['reasoning_content'] = reasoning_text
-    if tool_calls:
-        message['tool_calls'] = tool_calls
-
-    usage = _convert_usage(data.get('usageMetadata', {}))
-
-    return {
-        'id': request_id,
-        'object': 'chat.completion',
-        'model': data.get('modelVersion', 'gemini'),
-        'choices': [{'index': 0, 'message': message, 'finish_reason': finish_reason}],
-        'usage': usage,
-    }
+    return build_cc_response(
+        response_id=request_id,
+        message=build_cc_message(content_text, reasoning_text, tool_calls),
+        finish_reason=finish_reason,
+        usage=_convert_usage(data.get('usageMetadata', {})),
+        model=data.get('modelVersion', 'gemini'),
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -166,15 +167,7 @@ class GeminiStreamConverter:
         return results
 
     def _make_chunk(self, delta: JsonDict, finish_reason: str | None = None) -> JsonDict:
-        choice: JsonDict = {'index': 0, 'delta': delta}
-        if finish_reason:
-            choice['finish_reason'] = finish_reason
-        return {
-            'id': self._id,
-            'object': 'chat.completion.chunk',
-            'model': 'gemini',
-            'choices': [choice],
-        }
+        return make_cc_chunk(self._id, delta, finish_reason, model='gemini')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -194,7 +187,7 @@ def _convert_message(msg: JsonDict) -> JsonDict | None:
             'parts': [{
                 'functionResponse': {
                     'name': msg.get('name', msg.get('tool_call_id', '')),
-                    'response': _parse_json_safe(msg.get('content', '')),
+                    'response': parse_json_safe(msg.get('content', ''), fallback={'result': msg.get('content', '')} if msg.get('content', '') else {}),
                 },
             }],
         }
@@ -221,7 +214,7 @@ def _convert_message(msg: JsonDict) -> JsonDict | None:
         parts.append({
             'functionCall': {
                 'name': func.get('name', ''),
-                'args': _parse_json_safe(func.get('arguments', '{}')),
+                'args': parse_json_safe(func.get('arguments', '{}'), fallback={}),
             },
         })
 
@@ -304,15 +297,12 @@ def _extract_parts(parts: list[Any]) -> tuple[str, str, list[JsonDict]]:
             text += part['text']
         elif 'functionCall' in part:
             fc = part['functionCall']
-            tool_calls.append({
-                'index': len(tool_calls),
-                'id': fc.get('id') or gen_id('call_'),
-                'type': 'function',
-                'function': {
-                    'name': fc.get('name', ''),
-                    'arguments': json.dumps(fc.get('args', {}), ensure_ascii=False),
-                },
-            })
+            tool_calls.append(build_cc_tool_call(
+                call_id=fc.get('id') or gen_id('call_'),
+                name=fc.get('name', ''),
+                arguments=json.dumps(fc.get('args', {}), ensure_ascii=False),
+                index=len(tool_calls),
+            ))
 
     return text, reasoning, tool_calls
 
@@ -322,12 +312,7 @@ def _convert_usage(meta: JsonDict) -> JsonDict:
     prompt = meta.get('promptTokenCount', 0)
     candidates = meta.get('candidatesTokenCount', 0)
     thoughts = meta.get('thoughtsTokenCount', 0)
-    completion = candidates + thoughts
-    return {
-        'prompt_tokens': prompt,
-        'completion_tokens': completion,
-        'total_tokens': prompt + completion,
-    }
+    return build_cc_usage(prompt, candidates + thoughts)
 
 
 def _merge_same_role(contents: list[JsonDict]) -> list[JsonDict]:
@@ -343,21 +328,65 @@ def _merge_same_role(contents: list[JsonDict]) -> list[JsonDict]:
     return merged
 
 
-def _flatten_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return '\n'.join(
-            p.get('text', '') if isinstance(p, dict) else str(p)
-            for p in content
-        )
-    return str(content)
 
 
-def _parse_json_safe(text: Any) -> Any:
-    if not isinstance(text, str):
-        return text if text is not None else {}
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return {'result': text} if text else {}
+# ═══════════════════════════════════════════════════════════
+#  OutboundTransformer 实现: Gemini Contents
+# ═══════════════════════════════════════════════════════════
+
+
+class GeminiOutbound:
+    """Gemini Contents 后端的出站转换器。
+
+    将 CC 格式转换为 Gemini generateContent 格式并处理响应。
+    """
+
+    def build_request(self, payload: JsonDict) -> JsonDict:
+        return cc_to_gemini_request(payload)
+
+    def build_url(self, ctx) -> str:
+        base = ctx.target_url.rstrip('/')
+        model = ctx.upstream_model
+        if ctx.is_stream:
+            return f'{base}/v1/models/{model}:streamGenerateContent?alt=sse'
+        return f'{base}/v1/models/{model}:generateContent'
+
+    def build_headers(self, ctx) -> dict[str, str]:
+        from utils.http import build_gemini_headers
+        return build_gemini_headers(ctx.api_key)
+
+    def parse_response(self, raw: JsonDict) -> JsonDict:
+        return gemini_to_cc_response(raw)
+
+    def create_stream_processor(self) -> GeminiStreamProcessor:
+        return GeminiStreamProcessor()
+
+
+class GeminiStreamProcessor:
+    """Gemini SSE 流式处理器。
+
+    包装 iter_gemini_sse + GeminiStreamConverter。
+    """
+
+    def __init__(self):
+        self._converter = GeminiStreamConverter()
+
+    def iter_events(self, response) -> Iterator:
+        from utils.http import iter_gemini_sse
+        yield from iter_gemini_sse(response)
+
+    def process_event(self, event: JsonDict) -> list[JsonDict]:
+        return self._converter.process_chunk(event)
+
+    def extract_usage(self, event: JsonDict) -> JsonDict | None:
+        usage_meta = event.get('usageMetadata') if isinstance(event, dict) else None
+        if isinstance(usage_meta, dict):
+            return {
+                'prompt_tokens': usage_meta.get('promptTokenCount', 0),
+                'completion_tokens': usage_meta.get('candidatesTokenCount', 0),
+                'total_tokens': usage_meta.get('totalTokenCount', 0),
+            }
+        return None
+
+    def finalize(self) -> list[JsonDict]:
+        return []

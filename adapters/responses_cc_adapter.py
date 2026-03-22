@@ -15,8 +15,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
+from adapters.helpers import (
+    build_cc_message,
+    build_cc_response,
+    build_cc_tool_call,
+    build_cc_usage,
+    extract_text,
+    make_cc_chunk,
+    stringify_content,
+)
+from adapters.unified import UnifiedUsage
 from utils.http import gen_id
 
 JsonDict = dict[str, Any]
@@ -85,7 +95,7 @@ def cc_to_responses(cc_resp: JsonDict, model: str = '') -> JsonDict:
         'status': _response_status_from_finish_reason(finish_reason),
         'model': model or cc_resp.get('model', ''),
         'output': _build_responses_output(message),
-        'usage': _build_responses_usage(cc_resp.get('usage', {})),
+        'usage': UnifiedUsage.from_cc_dict(cc_resp.get('usage', {})).to_responses_dict(),
     }
 
 
@@ -94,31 +104,18 @@ def responses_to_cc_response(response_data: JsonDict, model: str = '') -> JsonDi
     output_items = response_data.get('output', [])
     content_text, reasoning_text, tool_calls = _collect_cc_parts_from_responses_output(output_items)
     finish_reason = _cc_finish_reason_from_responses(response_data, tool_calls)
-    message = {
-        'role': 'assistant',
-        'content': content_text or None,
-    }
-    if reasoning_text:
-        message['reasoning_content'] = reasoning_text
-    if tool_calls:
-        message['tool_calls'] = tool_calls
-
     usage = response_data.get('usage', {})
-    return {
-        'id': response_data.get('id', gen_id('chatcmpl-')),
-        'object': 'chat.completion',
-        'model': model or response_data.get('model', ''),
-        'choices': [{
-            'index': 0,
-            'message': message,
-            'finish_reason': finish_reason,
-        }],
-        'usage': {
-            'prompt_tokens': usage.get('input_tokens', 0),
-            'completion_tokens': usage.get('output_tokens', 0),
-            'total_tokens': usage.get('total_tokens', 0),
-        },
-    }
+
+    return build_cc_response(
+        response_id=response_data.get('id', gen_id('chatcmpl-')),
+        message=build_cc_message(content_text, reasoning_text, tool_calls),
+        finish_reason=finish_reason,
+        usage=build_cc_usage(
+            input_tokens=usage.get('input_tokens', 0),
+            output_tokens=usage.get('output_tokens', 0),
+        ),
+        model=model or response_data.get('model', ''),
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -658,15 +655,7 @@ class ResponsesToCCStreamConverter:
 
     def _make_chunk(self, delta: JsonDict, finish_reason: str | None = None) -> JsonDict:
         """构造标准 Chat Completions chunk。"""
-        choice: JsonDict = {'index': 0, 'delta': delta}
-        if finish_reason:
-            choice['finish_reason'] = finish_reason
-        return {
-            'id': self._id,
-            'object': 'chat.completion.chunk',
-            'model': self._model,
-            'choices': [choice],
-        }
+        return make_cc_chunk(self._id, delta, finish_reason, model=self._model)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -715,7 +704,7 @@ def _append_responses_input_item(
     content = message.get('content')
 
     if role == 'system':
-        text = _content_to_text(content)
+        text = extract_text(content)
         if text:
             instructions.append(text)
         return
@@ -724,11 +713,11 @@ def _append_responses_input_item(
         input_items.append({
             'type': 'function_call_output',
             'call_id': message.get('tool_call_id', ''),
-            'output': _stringify_output(content),
+            'output': stringify_content(content),
         })
         return
 
-    text = _content_to_text(content)
+    text = extract_text(content)
     has_tool_calls = bool(message.get('tool_calls'))
 
     if role == 'assistant' and has_tool_calls:
@@ -771,7 +760,7 @@ def _convert_input_items(items: list[Any], messages: list[JsonDict]) -> None:
         if role and not item_type:
             msg: JsonDict = {
                 'role': role,
-                'content': _normalize_simple_content(item.get('content', '')),
+                'content': extract_text(item.get('content', '')),
             }
             if role == 'assistant' and pending_reasoning:
                 msg['reasoning_content'] = pending_reasoning
@@ -810,7 +799,7 @@ def _append_message_item(items: list[Any], *, start: int, messages: list[JsonDic
     """将一个 message 项及其后续连续 function_call 项合并成一条消息。"""
     item = items[start]
     role = item.get('role', 'assistant')
-    content = _extract_text(item.get('content', []))
+    content = extract_text(item.get('content', []))
     message: JsonDict = {'role': role, 'content': content or ''}
 
     if role == 'assistant':
@@ -828,7 +817,11 @@ def _append_message_item(items: list[Any], *, start: int, messages: list[JsonDic
 
 def _append_function_call_item(item: JsonDict, messages: list[JsonDict]) -> None:
     """将独立的 Responses `function_call` 项挂接到最近的 assistant 消息上。"""
-    tool_call = _build_cc_tool_call(item)
+    tool_call = build_cc_tool_call(
+        call_id=item.get('call_id') or gen_id('call_'),
+        name=item.get('name', ''),
+        arguments=item.get('arguments', '{}'),
+    )
 
     if messages and messages[-1]['role'] == 'assistant':
         messages[-1].setdefault('tool_calls', []).append(tool_call)
@@ -851,12 +844,6 @@ def _convert_function_call_output_item(item: JsonDict) -> JsonDict:
     }
 
 
-def _normalize_simple_content(content: Any) -> str:
-    """将简单 content 载荷规范化为纯文本字符串。"""
-    if isinstance(content, list):
-        return _extract_text(content) or ''
-    return str(content) if content is not None else ''
-
 
 def _collect_function_calls(items: list[Any], start: int) -> tuple[list[JsonDict], int]:
     """收集从指定位置开始连续出现的 `function_call` 项。"""
@@ -865,23 +852,16 @@ def _collect_function_calls(items: list[Any], start: int) -> tuple[list[JsonDict
     while index < len(items):
         next_item = items[index]
         if isinstance(next_item, dict) and next_item.get('type') == 'function_call':
-            tool_calls.append(_build_cc_tool_call(next_item))
+            tool_calls.append(build_cc_tool_call(
+                call_id=next_item.get('call_id') or gen_id('call_'),
+                name=next_item.get('name', ''),
+                arguments=next_item.get('arguments', '{}'),
+            ))
             index += 1
         else:
             break
     return tool_calls, index - start
 
-
-def _build_cc_tool_call(item: JsonDict) -> JsonDict:
-    """将单个 Responses `function_call` 项转换为 CC `tool_call` 结构。"""
-    return {
-        'id': item.get('call_id') or gen_id('call_'),
-        'type': 'function',
-        'function': {
-            'name': item.get('name', ''),
-            'arguments': item.get('arguments', '{}'),
-        },
-    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -936,14 +916,6 @@ def _make_function_call_output_item(tool_call: JsonDict) -> JsonDict:
     }
 
 
-def _build_responses_usage(usage: JsonDict) -> JsonDict:
-    """将 Chat Completions 的 usage 字段映射为 Responses usage 结构。"""
-    return {
-        'input_tokens': usage.get('prompt_tokens', 0),
-        'output_tokens': usage.get('completion_tokens', 0),
-        'total_tokens': usage.get('total_tokens', 0),
-    }
-
 
 def _collect_cc_parts_from_responses_output(output_items: Any) -> tuple[str, str, list[JsonDict]]:
     """从 Responses `output` 中提取文本、思考摘要和工具调用。"""
@@ -959,11 +931,16 @@ def _collect_cc_parts_from_responses_output(output_items: Any) -> tuple[str, str
             continue
         item_type = item.get('type', '')
         if item_type == 'message':
-            content_text += _extract_text(item.get('content', []))
+            content_text += extract_text(item.get('content', []))
         elif item_type == 'reasoning':
             reasoning_text += _extract_reasoning_text(item)
         elif item_type == 'function_call':
-            tool_calls.append(_build_cc_tool_call_from_responses_output(item, index=len(tool_calls)))
+            tool_calls.append(build_cc_tool_call(
+                call_id=item.get('call_id') or gen_id('call_'),
+                name=item.get('name', ''),
+                arguments=item.get('arguments', '{}'),
+                index=len(tool_calls),
+            ))
 
     return content_text, reasoning_text, tool_calls
 
@@ -979,18 +956,6 @@ def _extract_reasoning_text(item: JsonDict) -> str:
             texts.append(part.get('text', ''))
     return ''.join(texts)
 
-
-def _build_cc_tool_call_from_responses_output(item: JsonDict, *, index: int) -> JsonDict:
-    """将 Responses `function_call` 输出项转换为 CC `tool_call`。"""
-    return {
-        'index': index,
-        'id': item.get('call_id') or gen_id('call_'),
-        'type': 'function',
-        'function': {
-            'name': item.get('name', ''),
-            'arguments': item.get('arguments', '{}'),
-        },
-    }
 
 
 def _cc_finish_reason_from_responses(response_data: JsonDict, tool_calls: list[JsonDict]) -> str:
@@ -1017,57 +982,7 @@ def _map_anthropic_stop_reason(stop_reason: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 
-def _extract_text(content: Any) -> str:
-    """从多种内容块结构中提取并拼接纯文本。"""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return str(content) if content else ''
 
-    texts: list[str] = []
-    for part in content:
-        if isinstance(part, str):
-            texts.append(part)
-        elif isinstance(part, dict):
-            part_type = part.get('type', '')
-            if part_type in ('output_text', 'input_text', 'text'):
-                texts.append(part.get('text', ''))
-            elif part_type == 'refusal':
-                texts.append(part.get('refusal', ''))
-    return '\n'.join(texts) if texts else ''
-
-
-def _content_to_text(content: Any) -> str:
-    """将任意 content 载荷转换为单个字符串。"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return _extract_text(content)
-    return str(content) if content is not None else ''
-
-
-def _content_to_responses_parts(content: Any, role: str = 'user') -> list[JsonDict]:
-    """将普通消息内容转换为 Responses 内容块数组。
-
-    assistant 消息使用 output_text，其他角色使用 input_text。
-    """
-    if isinstance(content, list):
-        text = _extract_text(content)
-    else:
-        text = _content_to_text(content)
-    if not text:
-        return []
-    part_type = 'output_text' if role == 'assistant' else 'input_text'
-    return [{'type': part_type, 'text': text}]
-
-
-def _stringify_output(content: Any) -> str:
-    """将工具输出统一序列化为字符串，便于放入 `function_call_output`。"""
-    if isinstance(content, str):
-        return content
-    if content is None:
-        return ''
-    return json.dumps(content, ensure_ascii=False) if not isinstance(content, str) else content
 
 
 def _build_responses_function_call_item(tool_call: JsonDict) -> JsonDict:
@@ -1079,6 +994,165 @@ def _build_responses_function_call_item(tool_call: JsonDict) -> JsonDict:
         'name': function_data.get('name', ''),
         'arguments': function_data.get('arguments', '{}'),
     }
+
+
+# ═══════════════════════════════════════════════════════════
+#  OutboundTransformer 实现: Responses
+# ═══════════════════════════════════════════════════════════
+
+
+class ResponsesOutbound:
+    """OpenAI Responses 后端的出站转换器。
+
+    将 CC 格式转换为 Responses 格式并处理响应。
+    """
+
+    def build_request(self, payload: JsonDict) -> JsonDict:
+        return cc_to_responses_request(payload)
+
+    def build_url(self, ctx) -> str:
+        return f'{ctx.target_url.rstrip("/")}/v1/responses'
+
+    def build_headers(self, ctx) -> dict[str, str]:
+        from utils.http import build_openai_headers
+        return build_openai_headers(ctx.api_key)
+
+    def parse_response(self, raw: JsonDict) -> JsonDict:
+        return responses_to_cc_response(raw)
+
+    def create_stream_processor(self) -> ResponsesStreamProcessorForCC:
+        return ResponsesStreamProcessorForCC()
+
+
+class ResponsesStreamProcessorForCC:
+    """Responses SSE → CC chunk 流式处理器。
+
+    用于 /v1/chat/completions -> /v1/responses 的桥接路径。
+    """
+
+    def __init__(self):
+        self._converter = ResponsesToCCStreamConverter()
+
+    def iter_events(self, response) -> Iterator:
+        from utils.http import iter_responses_sse
+        yield from iter_responses_sse(response)
+
+    def process_event(self, event: tuple) -> list[JsonDict]:
+        event_type, event_data = event
+        return self._converter.process_event(event_type, event_data)
+
+    def extract_usage(self, event: tuple) -> JsonDict | None:
+        from adapters.unified import extract_responses_usage
+        event_type, event_data = event
+        extracted = extract_responses_usage(event_data)
+        if extracted:
+            return {
+                'prompt_tokens': extracted.get('input_tokens', 0),
+                'completion_tokens': extracted.get('output_tokens', 0),
+                'total_tokens': extracted.get('total_tokens', 0),
+            }
+        return None
+
+    def finalize(self) -> list[JsonDict]:
+        return []
+
+
+class ResponsesNativeOutbound:
+    """Responses 后端原生透传的出站转换器。
+
+    当 /v1/responses → /v1/responses 时直接透传，不经过 CC 中间格式。
+    """
+
+    def build_request(self, payload: JsonDict) -> JsonDict:
+        return payload
+
+    def build_url(self, ctx) -> str:
+        return f'{ctx.target_url.rstrip("/")}/v1/responses'
+
+    def build_headers(self, ctx) -> dict[str, str]:
+        from utils.http import build_openai_headers
+        return build_openai_headers(ctx.api_key)
+
+    def parse_response(self, raw: JsonDict) -> JsonDict:
+        return raw
+
+    def create_stream_processor(self) -> ResponsesNativeStreamProcessor:
+        return ResponsesNativeStreamProcessor()
+
+
+class ResponsesNativeStreamProcessor:
+    """Responses 原生 SSE 透传流式处理器。
+
+    上游就是 Responses 格式，只需透传事件并做轻量模型名改写。
+    每个事件作为 SSE 字符串直接返回。
+    """
+
+    def iter_events(self, response) -> Iterator:
+        from utils.http import iter_responses_sse
+        yield from iter_responses_sse(response)
+
+    def process_event(self, event: tuple) -> list[JsonDict]:
+        event_type, event_data = event
+        return [{'_sse_event_type': event_type, **event_data}]
+
+    def extract_usage(self, event: tuple) -> JsonDict | None:
+        from adapters.unified import extract_responses_usage
+        _, event_data = event
+        return extract_responses_usage(event_data)
+
+    def finalize(self) -> list[JsonDict]:
+        return []
+
+
+class AnthropicOutboundForResponses:
+    """Anthropic 后端的出站转换器（用于 /v1/responses 路由）。
+
+    流式处理直接将 Anthropic SSE → Responses SSE，
+    跳过 CC 中间态以保留原始时序。
+    """
+
+    def build_request(self, payload: JsonDict) -> JsonDict:
+        from adapters.cc_anthropic_adapter import cc_to_messages_request
+        return cc_to_messages_request(payload)
+
+    def build_url(self, ctx) -> str:
+        return f'{ctx.target_url.rstrip("/")}/v1/messages'
+
+    def build_headers(self, ctx) -> dict[str, str]:
+        from utils.http import build_anthropic_headers
+        return build_anthropic_headers(ctx.api_key)
+
+    def parse_response(self, raw: JsonDict) -> JsonDict:
+        from adapters.cc_anthropic_adapter import messages_to_cc_response
+        return messages_to_cc_response(raw)
+
+    def create_stream_processor(self) -> AnthropicToResponsesStreamProcessor:
+        return AnthropicToResponsesStreamProcessor()
+
+
+class AnthropicToResponsesStreamProcessor:
+    """Anthropic SSE → Responses SSE 直接转换的流式处理器。
+
+    跳过 CC 中间态，直接将 Anthropic 事件映射为 Responses 事件。
+    返回的 chunk 是 SSE 字符串。
+    """
+
+    def __init__(self):
+        self._converter = ResponsesStreamConverter()
+
+    def iter_events(self, response) -> Iterator:
+        from utils.http import iter_anthropic_sse
+        yield from iter_anthropic_sse(response)
+
+    def process_event(self, event: tuple) -> list[str]:
+        event_type, event_data = event
+        return self._converter.process_anthropic_event(event_type, event_data)
+
+    def extract_usage(self, event: tuple) -> JsonDict | None:
+        return None
+
+    def finalize(self) -> list[str]:
+        return self._converter.finalize()
 
 
 def _convert_cc_tools_to_responses(tools: Any) -> list[JsonDict]:

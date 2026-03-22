@@ -12,7 +12,6 @@ import logging
 from typing import Any
 
 import settings
-from utils.http import build_anthropic_headers, build_gemini_headers, build_openai_headers
 
 logger = logging.getLogger(__name__)
 
@@ -54,42 +53,6 @@ def build_route_context(client_model: str, is_stream: bool) -> RouteContext:
         header_modifications=mapping.get('header_modifications', {}),
     )
 
-
-def build_openai_target(ctx: RouteContext) -> tuple[str, dict[str, str]]:
-    """根据路由上下文生成 OpenAI 兼容后端的地址和请求头。"""
-    url = f'{ctx.target_url.rstrip("/")}/v1/chat/completions'
-    headers = build_openai_headers(ctx.api_key)
-    return url, headers
-
-
-def build_responses_target(ctx: RouteContext) -> tuple[str, dict[str, str]]:
-    """根据路由上下文生成 OpenAI Responses 后端的地址和请求头。"""
-    url = f'{ctx.target_url.rstrip("/")}/v1/responses'
-    headers = build_openai_headers(ctx.api_key)
-    return url, headers
-
-
-def build_anthropic_target(ctx: RouteContext) -> tuple[str, dict[str, str]]:
-    """根据路由上下文生成 Anthropic 后端的地址和请求头。"""
-    url = f'{ctx.target_url.rstrip("/")}/v1/messages'
-    headers = build_anthropic_headers(ctx.api_key)
-    return url, headers
-
-
-def build_gemini_target(ctx: RouteContext, stream: bool = False) -> tuple[str, dict[str, str]]:
-    """根据路由上下文生成 Gemini 后端的地址和请求头。
-
-    Gemini URL 格式: {base}/v1/models/{model}:generateContent
-    流式: {base}/v1/models/{model}:streamGenerateContent?alt=sse
-    """
-    base = ctx.target_url.rstrip('/')
-    model = ctx.upstream_model
-    if stream:
-        url = f'{base}/v1/models/{model}:streamGenerateContent?alt=sse'
-    else:
-        url = f'{base}/v1/models/{model}:generateContent'
-    headers = build_gemini_headers(ctx.api_key)
-    return url, headers
 
 
 def log_route_context(route_name: str, ctx: RouteContext, *, extra: str = '') -> None:
@@ -135,11 +98,6 @@ def sse_event_message(event_type: str, data: Any) -> str:
     """构造带 event 名称的 SSE 消息。"""
     payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
     return f'event: {event_type}\ndata: {payload}\n\n'
-
-
-def chat_error_chunk(message: str, error_type: str = 'upstream_error') -> str:
-    """构造聊天补全流式接口使用的错误消息。"""
-    return sse_data_message({'error': {'message': message, 'type': error_type}})
 
 
 def responses_error_event(message: str) -> str:
@@ -248,3 +206,140 @@ def apply_header_modifications(headers: dict[str, str], modifications: dict[str,
             headers[key] = str(value)
     logger.info('已应用 header_modifications: %s', list(modifications.keys()))
     return headers
+
+
+# ═══════════════════════════════════════════════════════════
+#  后端注册表 + ClientFormatter 实现
+# ═══════════════════════════════════════════════════════════
+
+
+def get_outbound(backend: str):
+    """根据后端类型获取对应的 OutboundTransformer 实例。"""
+    from adapters.cc_anthropic_adapter import AnthropicOutbound
+    from adapters.cc_gemini_adapter import GeminiOutbound
+    from adapters.openai_compat_fixer import OpenAIChatOutbound
+    from adapters.responses_cc_adapter import ResponsesOutbound
+
+    registry = {
+        'openai': OpenAIChatOutbound,
+        'anthropic': AnthropicOutbound,
+        'gemini': GeminiOutbound,
+        'responses': ResponsesOutbound,
+    }
+    cls = registry.get(backend, OpenAIChatOutbound)
+    return cls()
+
+
+class CCClientFormatter:
+    """Chat Completions 客户端格式化器。
+
+    将通用处理结果格式化为 OpenAI Chat Completions 格式，
+    供 /v1/chat/completions 端点使用。
+    """
+
+    def format_response(self, cc_response: dict[str, Any], model: str) -> dict[str, Any]:
+        cc_response['model'] = model
+        return cc_response
+
+    def wrap_stream_item(self, item: Any) -> str:
+        payload = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+        return f'data: {payload}\n\n'
+
+    def format_error(self, message: str) -> str:
+        return sse_data_message({'error': {'message': message, 'type': 'upstream_error'}})
+
+    def format_done(self) -> str | None:
+        return sse_data_message('[DONE]')
+
+    def start_events(self) -> list[str]:
+        return []
+
+    @property
+    def usage_input_key(self) -> str:
+        return 'prompt_tokens'
+
+    @property
+    def usage_output_key(self) -> str:
+        return 'completion_tokens'
+
+
+class ResponsesClientFormatter:
+    """Responses API 客户端格式化器。
+
+    将通用处理结果格式化为 OpenAI Responses 格式，
+    供 /v1/responses 端点使用。
+
+    流式场景使用 ResponsesStreamConverter 做 CC chunk → Responses SSE 转换。
+    """
+
+    def __init__(self, model: str = ''):
+        from adapters.responses_cc_adapter import ResponsesStreamConverter, cc_to_responses
+        self._model = model
+        self._converter = ResponsesStreamConverter(model=model)
+        self._cc_to_responses = cc_to_responses
+
+    def format_response(self, cc_response: dict[str, Any], model: str) -> dict[str, Any]:
+        return self._cc_to_responses(cc_response, model)
+
+    def wrap_stream_item(self, item: Any) -> str:
+        if isinstance(item, str):
+            return item
+        events = self._converter.process_cc_chunk(item)
+        return ''.join(events)
+
+    def format_error(self, message: str) -> str:
+        return responses_error_event(message)
+
+    def format_done(self) -> str | None:
+        events = self._converter.finalize()
+        return ''.join(events) if events else None
+
+    def start_events(self) -> list[str]:
+        return self._converter.start_events()
+
+    @property
+    def usage_input_key(self) -> str:
+        return 'input_tokens'
+
+    @property
+    def usage_output_key(self) -> str:
+        return 'output_tokens'
+
+
+class ResponsesPassthroughFormatter:
+    """Responses 透传格式化器。
+
+    当后端本身就是 Responses 格式时使用，做轻量模型名改写。
+    """
+
+    def __init__(self, model: str = ''):
+        self._model = model
+
+    def format_response(self, response_data: dict[str, Any], model: str) -> dict[str, Any]:
+        response_data['model'] = model
+        return response_data
+
+    def wrap_stream_item(self, item: Any) -> str:
+        if isinstance(item, str):
+            return item
+        event_type = item.pop('_sse_event_type', None)
+        if event_type:
+            return f'event: {event_type}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n'
+        return f'data: {json.dumps(item, ensure_ascii=False)}\n\n'
+
+    def format_error(self, message: str) -> str:
+        return responses_error_event(message)
+
+    def format_done(self) -> str | None:
+        return None
+
+    def start_events(self) -> list[str]:
+        return []
+
+    @property
+    def usage_input_key(self) -> str:
+        return 'input_tokens'
+
+    @property
+    def usage_output_key(self) -> str:
+        return 'output_tokens'
