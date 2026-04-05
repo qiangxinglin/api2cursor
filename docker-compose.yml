@@ -1,6 +1,7 @@
 services:
   api2cursor:
     build: .
+    container_name: api2cursor
     ports:
       - "${PROXY_PORT:-3029}:${PROXY_PORT:-3029}"
     env_file:
