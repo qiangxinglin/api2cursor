@@ -42,6 +42,7 @@ from routes.common import (
     build_responses_target,
     build_route_context,
     chat_error_chunk,
+    ensure_prompt_cache_key,
     inject_instructions_anthropic,
     inject_instructions_cc,
     inject_instructions_responses,
@@ -312,6 +313,7 @@ def _handle_responses_backend(ctx: RouteContext, payload: dict[str, Any], turn: 
     responses_payload = cc_to_responses_request(payload)
     responses_payload['model'] = ctx.upstream_model
     responses_payload = inject_instructions_responses(responses_payload, ctx.custom_instructions, ctx.instructions_position)
+    responses_payload = ensure_prompt_cache_key(responses_payload)
     _dbg(
         '已转换为 Responses 请求：字段=' + str(list(responses_payload.keys()))
         + f' 输入项数={len(responses_payload.get("input", []))}'

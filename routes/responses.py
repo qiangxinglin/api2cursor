@@ -27,6 +27,7 @@ from routes.common import (
     build_openai_target,
     build_responses_target,
     build_route_context,
+    ensure_prompt_cache_key,
     inject_instructions_anthropic,
     inject_instructions_cc,
     inject_instructions_responses,
@@ -247,6 +248,7 @@ def _handle_responses_backend(ctx: RouteContext, payload: dict[str, Any], turn: 
     payload = dict(payload)
     payload['model'] = ctx.upstream_model
     payload = inject_instructions_responses(payload, ctx.custom_instructions, ctx.instructions_position)
+    payload = ensure_prompt_cache_key(payload)
     url, headers = build_responses_target(ctx)
     payload = apply_body_modifications(payload, ctx.body_modifications)
     headers = apply_header_modifications(headers, ctx.header_modifications)
