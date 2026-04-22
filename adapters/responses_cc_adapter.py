@@ -344,11 +344,17 @@ class ResponsesStreamConverter:
         if self._rs_started:
             return []
         self._rs_started = True
-        return [self._sse('response.output_item.added', {
-            'type': 'reasoning',
-            'id': self._rs_id,
-            'summary': [],
-        })]
+        return [
+            self._sse('response.output_item.added', {
+                'type': 'reasoning',
+                'id': self._rs_id,
+                'summary': [],
+            }),
+            self._sse('response.reasoning_summary_part.added', {
+                'type': 'summary_text',
+                'text': '',
+            }),
+        ]
 
     def _append_reasoning_delta(self, text: str) -> list[str]:
         """向 reasoning 输出项追加思考内容增量。"""
@@ -462,6 +468,10 @@ class ResponsesStreamConverter:
         }
         self._output_items.append(reasoning_item)
         return [
+            self._sse('response.reasoning_summary_part.done', {
+                'type': 'summary_text',
+                'text': self._rs_buf,
+            }),
             self._sse('response.reasoning_summary_text.done', {
                 'type': 'summary_text',
                 'text': self._rs_buf,
